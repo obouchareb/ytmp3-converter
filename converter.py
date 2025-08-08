@@ -1,11 +1,11 @@
-from fastapi import FastAPI, Query, Response
-from fastapi.responses import StreamingResponse, PlainTextResponse
-import subprocess, tempfile, os, io, re
-from pydub import AudioSegment
+from fastapi import FastAPI, Query
+from fastapi.responses import FileResponse, PlainTextResponse
+import subprocess, tempfile, os, re
+from urllib.parse import quote
 
 app = FastAPI()
 
-# Read cookies from an environment variable and write to a temp file
+# Read YouTube cookies from an env var and persist to a temp file for yt-dlp
 COOKIES_ENV = os.environ.get("YTDLP_COOKIES")
 COOKIE_PATH = None
 if COOKIES_ENV:
@@ -14,11 +14,8 @@ if COOKIES_ENV:
         f.write(COOKIES_ENV)
 
 def sanitize(name: str, ext: str = "mp3") -> str:
-    # Remove filesystem-unsafe chars and trim length
     name = re.sub(r'[\\/:*?"<>|]+', "", name or "").strip()
-    if len(name) > 120:
-        name = name[:120]
-    return f"{name or 'episode'}.{ext}"
+    return f"{(name[:120] or 'episode')}.{ext}"
 
 @app.get("/health")
 def health():
@@ -28,65 +25,48 @@ def health():
 def convert(
     url: str = Query(..., description="YouTube URL"),
     title: str = Query("episode"),
-    description: str = Query(""),
-    filename: str = Query(None)
+    description: str = Query("")
 ):
-    # Ensure ffmpeg is available (needed by pydub)
-    try:
-        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=False)
-    except Exception as e:
-        return PlainTextResponse(
-            f"ffmpeg not available: {e}\nInstall ffmpeg on the server.",
-            status_code=500
-        )
-
-    # Download best audio using yt-dlp to a temp file
-    with tempfile.TemporaryDirectory() as tmp:
-        download_path = os.path.join(tmp, "audio")
-
+    # Make a temporary work folder for this request
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_base = os.path.join(tmpdir, "out")  # yt-dlp will set extension
         cmd = ["yt-dlp"]
-        # Use cookies if present to bypass YouTube bot checks
+
+        # Use cookies if available to pass YouTube bot checks
         if COOKIE_PATH and os.path.exists(COOKIE_PATH):
             cmd += ["--cookies", COOKIE_PATH]
 
-        # Best available audio, write to temp with actual extension
-        cmd += ["-f", "bestaudio/best", "-o", download_path + ".%(ext)s", url]
+        # Extract best audio and convert to mp3 on disk (no RAM buffering)
+        # Also write ID3 metadata via ffmpeg so Libsyn picks it up
+        pp_args = f'ffmpeg:-metadata title={title} -metadata comment={description}'
+        cmd += [
+            "-x",
+            "--audio-format", "mp3",
+            "--audio-quality", "0",
+            "--no-playlist",
+            "--postprocessor-args", pp_args,
+            "-o", out_base + ".%(ext)s",
+            url,
+        ]
 
         proc = subprocess.run(cmd, capture_output=True, text=True)
         if proc.returncode != 0:
-            return PlainTextResponse(
-                "yt-dlp error:\n" + proc.stderr,
-                status_code=400
-            )
+            return PlainTextResponse("yt-dlp error:\n" + proc.stderr, status_code=400)
 
-        # Find the downloaded file (webm/m4a/opus)
-        downloaded = None
-        for fn in os.listdir(tmp):
-            if fn.startswith("audio."):
-                downloaded = os.path.join(tmp, fn)
+        # Find the resulting mp3 file
+        mp3_path = None
+        for fn in os.listdir(tmpdir):
+            if fn.startswith("out.") and fn.endswith(".mp3"):
+                mp3_path = os.path.join(tmpdir, fn)
                 break
+        if not mp3_path or not os.path.exists(mp3_path):
+            return PlainTextResponse("No MP3 produced", status_code=500)
 
-        if not downloaded or not os.path.exists(downloaded):
-            return PlainTextResponse("No audio file downloaded", status_code=400)
-
-        # Convert to mp3 and embed basic tags
-        try:
-            audio = AudioSegment.from_file(downloaded)
-        except Exception as e:
-            return PlainTextResponse(f"Could not read downloaded audio: {e}", status_code=500)
-
-        mp3_bytes = io.BytesIO()
-        # Libsyn reads ID3 tags; title and comment are enough for now
-        try:
-            audio.export(
-                mp3_bytes,
-                format="mp3",
-                tags={"title": title or "episode", "comment": description or ""}
-            )
-        except Exception as e:
-            return PlainTextResponse(f"MP3 export failed: {e}", status_code=500)
-
-        mp3_bytes.seek(0)
-        out_name = sanitize(filename or title, "mp3")
-        headers = {"Content-Disposition": f'attachment; filename="{out_name}"'}
-        return StreamingResponse(mp3_bytes, media_type="audio/mpeg", headers=headers)
+        # Stream the file from disk (low memory)
+        filename = sanitize(title, "mp3")
+        return FileResponse(
+            mp3_path,
+            media_type="audio/mpeg",
+            filename=filename,
+            headers={"Content-Disposition": f'attachment; filename="{quote(filename)}"'}
+        )
