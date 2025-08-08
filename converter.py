@@ -1,11 +1,11 @@
 from fastapi import FastAPI, Query
-from fastapi.responses import FileResponse, PlainTextResponse, JSONResponse
-import subprocess, tempfile, os, re, sys
+from fastapi.responses import FileResponse, PlainTextResponse
+import subprocess, tempfile, os, re
 from urllib.parse import quote
 
 app = FastAPI()
 
-# ── Load cookies from ENV into a temp file for yt-dlp
+# Load cookies from ENV into a temp file
 COOKIES_ENV = os.environ.get("YTDLP_COOKIES")
 COOKIE_PATH = None
 if COOKIES_ENV:
@@ -19,10 +19,15 @@ def sanitize(name: str, ext: str = "mp3") -> str:
 
 def run_ytdlp(url, out_base, title, description, use_cookies=True):
     cmd = ["yt-dlp"]
+
+    # Use cookies if we have them
     if use_cookies and COOKIE_PATH and os.path.exists(COOKIE_PATH):
         cmd += ["--cookies", COOKIE_PATH]
 
-    # Write ID3 tags via ffmpeg, convert on disk (low memory)
+    # Spoof as modern web client to bypass "app" restriction
+    cmd += ["--extractor-args", "youtube:player_client=web"]
+
+    # Convert to mp3 with tags on disk (low memory)
     pp_args = f'ffmpeg:-metadata title={title} -metadata comment={description}'
     cmd += [
         "-x",
@@ -35,26 +40,6 @@ def run_ytdlp(url, out_base, title, description, use_cookies=True):
     ]
     return subprocess.run(cmd, capture_output=True, text=True)
 
-@app.get("/health")
-def health():
-    return {"ok": True}
-
-@app.get("/debug")
-def debug():
-    # Quick sanity to see if cookies are present and yt-dlp is installed
-    cookie_present = bool(COOKIE_PATH and os.path.exists(COOKIE_PATH))
-    cookie_size = os.path.getsize(COOKIE_PATH) if cookie_present else 0
-    try:
-        v = subprocess.run(["yt-dlp", "--version"], capture_output=True, text=True)
-        ytdlp_ver = (v.stdout or v.stderr).strip()
-    except Exception as e:
-        ytdlp_ver = f"error: {e}"
-    return JSONResponse({
-        "cookie_present": cookie_present,
-        "cookie_size_bytes": cookie_size,
-        "ytdlp_version": ytdlp_ver,
-    })
-
 @app.get("/convert")
 def convert(
     url: str = Query(..., description="YouTube URL"),
@@ -64,26 +49,25 @@ def convert(
     with tempfile.TemporaryDirectory() as tmpdir:
         out_base = os.path.join(tmpdir, "out")
 
-        # 1) Try with cookies if we have them
         used_cookies = bool(COOKIE_PATH and os.path.exists(COOKIE_PATH))
         proc = run_ytdlp(url, out_base, title, description, use_cookies=used_cookies)
 
-        # 2) If cookies fail or are invalid, try again without them
+        # Fallback without cookies if needed
         if proc.returncode != 0 and "cookies" in (proc.stderr or "").lower():
             proc = run_ytdlp(url, out_base, title, description, use_cookies=False)
 
         if proc.returncode != 0:
-            msg = "yt-dlp error:\n" + proc.stderr
-            # make it obvious in the response whether cookies were used
-            msg += f"\n(cookies_used={used_cookies})"
-            return PlainTextResponse(msg, status_code=400)
+            return PlainTextResponse(
+                "yt-dlp error:\n" + proc.stderr + f"\n(cookies_used={used_cookies})",
+                status_code=400
+            )
 
-        # Find resulting mp3
         mp3_path = None
         for fn in os.listdir(tmpdir):
             if fn.startswith("out.") and fn.endswith(".mp3"):
                 mp3_path = os.path.join(tmpdir, fn)
                 break
+
         if not mp3_path:
             return PlainTextResponse("No MP3 produced", status_code=500)
 
