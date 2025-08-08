@@ -17,6 +17,23 @@ def sanitize(name: str, ext: str = "mp3") -> str:
     name = re.sub(r'[\\/:*?"<>|]+', "", name or "").strip()
     return f"{(name[:120] or 'episode')}.{ext}"
 
+def run_ytdlp(url, out_base, title, description, use_cookies=True):
+    """Runs yt-dlp to download MP3, optionally with cookies."""
+    cmd = ["yt-dlp"]
+    if use_cookies and COOKIE_PATH and os.path.exists(COOKIE_PATH):
+        cmd += ["--cookies", COOKIE_PATH]
+    pp_args = f'ffmpeg:-metadata title={title} -metadata comment={description}'
+    cmd += [
+        "-x",
+        "--audio-format", "mp3",
+        "--audio-quality", "0",
+        "--no-playlist",
+        "--postprocessor-args", pp_args,
+        "-o", out_base + ".%(ext)s",
+        url,
+    ]
+    return subprocess.run(cmd, capture_output=True, text=True)
+
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -27,33 +44,20 @@ def convert(
     title: str = Query("episode"),
     description: str = Query("")
 ):
-    # Make a temporary work folder for this request
     with tempfile.TemporaryDirectory() as tmpdir:
-        out_base = os.path.join(tmpdir, "out")  # yt-dlp will set extension
-        cmd = ["yt-dlp"]
+        out_base = os.path.join(tmpdir, "out")
 
-        # Use cookies if available to pass YouTube bot checks
-        if COOKIE_PATH and os.path.exists(COOKIE_PATH):
-            cmd += ["--cookies", COOKIE_PATH]
+        # First try with cookies if we have them
+        proc = run_ytdlp(url, out_base, title, description, use_cookies=True)
 
-        # Extract best audio and convert to mp3 on disk (no RAM buffering)
-        # Also write ID3 metadata via ffmpeg so Libsyn picks it up
-        pp_args = f'ffmpeg:-metadata title={title} -metadata comment={description}'
-        cmd += [
-            "-x",
-            "--audio-format", "mp3",
-            "--audio-quality", "0",
-            "--no-playlist",
-            "--postprocessor-args", pp_args,
-            "-o", out_base + ".%(ext)s",
-            url,
-        ]
+        # If cookies fail, try without them
+        if proc.returncode != 0 or "cookies are no longer valid" in proc.stderr:
+            proc = run_ytdlp(url, out_base, title, description, use_cookies=False)
 
-        proc = subprocess.run(cmd, capture_output=True, text=True)
         if proc.returncode != 0:
             return PlainTextResponse("yt-dlp error:\n" + proc.stderr, status_code=400)
 
-        # Find the resulting mp3 file
+        # Find resulting mp3
         mp3_path = None
         for fn in os.listdir(tmpdir):
             if fn.startswith("out.") and fn.endswith(".mp3"):
@@ -62,7 +66,7 @@ def convert(
         if not mp3_path or not os.path.exists(mp3_path):
             return PlainTextResponse("No MP3 produced", status_code=500)
 
-        # Stream the file from disk (low memory)
+        # Stream file from disk
         filename = sanitize(title, "mp3")
         return FileResponse(
             mp3_path,
